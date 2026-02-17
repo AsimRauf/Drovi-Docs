@@ -1,0 +1,535 @@
+# 🔌 Drovi Socket.IO Testing Guide
+
+> **For mobile app developers:** This guide explains every socket event in Drovi, how to connect, and how to test each one using simple tools.
+
+---
+
+## 📡 Architecture Overview
+
+Drovi uses **2 WebSocket namespaces** (think of them as 2 separate socket connections):
+
+| Namespace | URL | Who Uses It |
+|---|---|---|
+| `/orders` | `ws://YOUR_SERVER:3001/orders` | Admin dashboard, Restaurant/Shop dashboard, Customer app, Rider app |
+| `/rider-location` | `ws://YOUR_SERVER:3001/rider-location` | Rider app (GPS tracking), Admin dashboard (live map) |
+
+---
+
+## 🧪 How to Test (Step by Step)
+
+### Tool: Use **Postman** (has Socket.IO support) or any Socket.IO test client
+
+#### Option 1: Postman (Recommended)
+1. Open Postman → New → Socket.IO Request
+2. Enter URL: `ws://localhost:3001/orders` or `ws://localhost:3001/rider-location`
+3. Under "Settings", set transport to `websocket`
+4. Click **Connect**
+5. You can now emit events and listen for responses
+
+#### Option 2: Simple HTML Test Page
+Save this as `test.html` and open in browser:
+
+```html
+<!DOCTYPE html>
+<html>
+<head><title>Drovi Socket Tester</title></head>
+<body>
+<h1>Drovi Socket Tester</h1>
+<pre id="log" style="background:#111;color:#0f0;padding:20px;height:500px;overflow:auto;"></pre>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+<script>
+function log(msg) {
+  document.getElementById('log').textContent += new Date().toLocaleTimeString() + ' | ' + msg + '\n';
+  document.getElementById('log').scrollTop = document.getElementById('log').scrollHeight;
+}
+
+// ==========================================
+// CHANGE THESE VALUES FOR YOUR TEST
+// ==========================================
+const SERVER = 'http://localhost:3001';
+const NAMESPACE = '/orders';  // or '/rider-location'
+
+const socket = io(SERVER + NAMESPACE, {
+  transports: ['websocket', 'polling'],
+});
+
+socket.on('connect', () => log('✅ CONNECTED! Socket ID: ' + socket.id));
+socket.on('disconnect', (reason) => log('❌ DISCONNECTED: ' + reason));
+socket.on('connect_error', (err) => log('❌ ERROR: ' + err.message));
+
+// Listen to ALL events (very useful for debugging)
+socket.onAny((event, ...args) => {
+  log('📨 EVENT: ' + event + ' → ' + JSON.stringify(args));
+});
+
+// === EXPOSE FUNCTIONS TO BROWSER CONSOLE ===
+window.socket = socket;
+window.emit = (event, data) => {
+  socket.emit(event, data, (response) => {
+    log('📬 RESPONSE for ' + event + ': ' + JSON.stringify(response));
+  });
+};
+
+log('🔌 Connecting to ' + SERVER + NAMESPACE + '...');
+</script>
+
+<h3>Open browser console (F12) and use:</h3>
+<pre style="background:#eee;padding:10px;">
+// Register as admin:
+emit('register_admin', { userId: 'YOUR_USER_ID' })
+
+// Register as customer:
+emit('register_customer', { customerId: 'YOUR_USER_ID' })
+
+// Register as rider:
+emit('register_rider', { riderId: 'YOUR_USER_ID' })
+
+// Register as vendor:
+emit('register_vendor', { vendorType: 'restaurant', vendorId: 'YOUR_RESTAURANT_ID' })
+
+// Subscribe to order updates:
+emit('subscribe_to_order', { orderId: 'ORDER_ID', customerId: 'YOUR_USER_ID' })
+
+// Ping test:
+emit('ping', {})
+</pre>
+</body>
+</html>
+```
+
+---
+
+## 🔄 Complete Order Flow (Socket Events)
+
+Here's the ENTIRE order lifecycle and which socket events fire at each step:
+
+```
+Customer places order (REST API)
+        │
+        ▼
+  ┌─────────────────┐
+  │ PENDING          │  No socket events yet (order is a draft)
+  └────────┬────────┘
+           │ Customer pays (REST API: POST /orders/confirm-draft)
+           ▼
+  ┌─────────────────┐
+  │ CONFIRMED        │  Socket: 'new_payment' → Admin dashboard (same city)
+  │                  │  Socket: 'order_ready' → Restaurant/Shop dashboard
+  └────────┬────────┘
+           │ Admin verifies payment (for EVC_PLUS)
+           ▼
+  ┌─────────────────┐
+  │ CONFIRMED        │  Socket: 'payment_verified' → Admin dashboard
+  │ (payment ok)     │  Socket: 'order_ready' → Restaurant/Shop dashboard
+  └────────┬────────┘
+           │ Restaurant clicks "Start Preparing"
+           ▼
+  ┌─────────────────┐
+  │ PREPARING        │  Socket: 'order_status_updated' → Customer app
+  │                  │  Socket: 'new_order_nearby' → Top 4 nearest riders
+  │                  │  (retries every 2 min × 5 = 10 min total)
+  └────────┬────────┘
+           │ Rider accepts order (REST API)
+           ▼
+  ┌─────────────────┐
+  │ ACCEPTED_BY_RIDER│  Socket: 'order_accepted' → Accepting rider
+  │                  │  Socket: 'order_no_longer_available' → Other notified riders
+  │                  │  Socket: 'rider_accepted' → Restaurant/Shop
+  │                  │  Socket: 'order_status_updated' → Customer
+  │                  │  Socket: 'rider_assigned' → Customer
+  └────────┬────────┘
+           │ Restaurant marks food ready
+           ▼
+  ┌─────────────────┐
+  │ READY_FOR_PICKUP │  Socket: 'order_status_updated' → Customer, Rider
+  └────────┬────────┘
+           │ Rider picks up order
+           ▼
+  ┌─────────────────┐
+  │ PICKED_UP        │  Socket: 'order_status_updated' → Customer, Restaurant
+  │                  │  Socket: 'rider_location_update' → Customer (real-time GPS)
+  └────────┬────────┘
+           │ Rider delivers order
+           ▼
+  ┌─────────────────┐
+  │ DELIVERED        │  Socket: 'order_status_updated' → Customer, Restaurant
+  └─────────────────┘
+```
+
+### Escalation (if no rider accepts):
+```
+After 10 minutes (5 retries × 2 min) with no rider accepting:
+  Socket: 'order_needs_attention' → Admin dashboard (same city)
+  Socket: 'order_escalation' → Admin dashboard (with full details + nearby rider phones)
+```
+
+---
+
+## 📋 ALL Socket Events Reference
+
+### Namespace: `/orders`
+
+#### Events YOU EMIT (client → server)
+
+| Event | Payload | Who Sends | Response |
+|---|---|---|---|
+| `ping` | `{}` | Anyone | `{ success: true }` + receives `pong` event |
+| `register_admin` | `{ userId: "admin-user-id" }` | Admin dashboard | `{ success: true, adminId: "..." }` |
+| `register_customer` | `{ customerId: "customer-user-id" }` | Customer app | `{ success: true, customerId: "..." }` |
+| `register_rider` | `{ riderId: "rider-user-id" }` | Rider app | `{ success: true, riderId: "..." }` |
+| `register_vendor` | `{ vendorType: "restaurant" \| "shop", vendorId: "vendor-id" }` | Restaurant/Shop dashboard | `{ success: true, room: "vendor:restaurant:abc123" }` |
+| `subscribe_to_order` | `{ orderId: "order-id", customerId: "customer-id" }` | Customer app | `{ success: true, orderId: "..." }` |
+| `unsubscribe_from_order` | `{ orderId: "order-id" }` | Customer app | `{ success: true }` |
+
+#### Events YOU LISTEN TO (server → client)
+
+| Event | Payload | Who Receives | When |
+|---|---|---|---|
+| `pong` | none | Anyone | Response to `ping` |
+| `new_payment` | Full order object | Admin (same city) | Customer submits payment |
+| `payment_verified` | `{ orderId, adminId }` | Admin (same city) | Admin verifies payment |
+| `payment_rejected` | `{ orderId, adminId, reason }` | Admin (same city) | Admin rejects payment |
+| `order_ready` | Full order object | Restaurant/Shop | Payment verified → order sent to vendor |
+| `order_status_updated` | `{ orderId, status, timestamp, ...orderData }` | Customer | Any order status change |
+| `rider_assigned` | `{ orderId, riderId }` | Customer | Rider accepts their order |
+| `rider_location_update` | `{ orderId, location: { latitude, longitude, timestamp } }` | Customer, Restaurant/Shop | Rider GPS updates (continuous) |
+| `new_order_nearby` | `{ orderId, publicId, vendorName, distance, estimatedEarnings, pickupAddress, deliveryAddress, items, paymentMethod, ... }` | Rider | New order available for pickup |
+| `order_no_longer_available` | `{ orderId, reason, message }` | Rider | Another rider accepted the order |
+| `order_accepted` | `{ orderId, order, timestamp }` | Rider | Your acceptance was confirmed |
+| `order_status_update` | `{ orderId, status, timestamp }` | Rider | Order status changed for your active order |
+| `rider_accepted` | `{ publicId, riderInfo: { name }, ... }` | Restaurant/Shop | A rider accepted their order |
+| `order_needs_attention` | `{ orderId, reason, timestamp }` | Admin (same city) | No riders available |
+| `order_escalation` | `{ orderId, publicId, orderTotal, restaurantName, customerName, nearbyRiderPhones, reason, priority: "HIGH", ... }` | Admin (same city) | 10-min escalation with full details |
+| `new_deposit_request` | Deposit data | Admin (same city) | Rider requests wallet deposit |
+| `new_withdrawal_request` | Withdrawal data | Admin (same city) | Rider requests wallet withdrawal |
+
+---
+
+### Namespace: `/rider-location`
+
+#### Events YOU EMIT (client → server)
+
+| Event | Payload | Who Sends | Response |
+|---|---|---|---|
+| `register_rider` | `{ riderId: "rider-user-id" }` | Rider app | `{ success: true, riderId: "...", status: "online" }` |
+| `update_location` | `{ riderId, latitude, longitude, heading?, speed?, accuracy? }` | Rider app | `{ success: true, timestamp: 123456 }` |
+| `update_status` | `{ riderId, status: "online" \| "offline" \| "busy" }` | Rider app | `{ success: true }` |
+| `admin_subscribe_rider` | `{ riderId: "rider-user-id" }` | Admin dashboard | `{ success: true }` |
+| `find_nearby_riders` | `{ latitude, longitude, radiusKm?, limit? }` | Admin dashboard | `{ success: true, riders: [...], count: N }` |
+| `get_rider_location` | `{ riderId: "rider-user-id" }` | Admin dashboard | `{ success: true, location: { ... } }` |
+
+#### Events YOU LISTEN TO (server → client)
+
+| Event | Payload | Who Receives | When |
+|---|---|---|---|
+| `rider_status_updated` | `{ riderId, status }` | Everyone on namespace | Rider goes online/offline/busy |
+| `rider_location_updated` | `{ riderId, latitude, longitude, timestamp, status, heading, speed, accuracy }` | Everyone on namespace | Any rider's location updates (for admin live map) |
+| `rider_location_update` | Full location object | Admin subscribers of specific rider | Detailed update for subscribed rider |
+| `new_order_nearby` | `{ orderId, distance, orderDetails }` | Rider | New order nearby (also emitted on `/orders` namespace) |
+
+---
+
+## 🧪 Test Scenarios (Step-by-Step)
+
+### Test 1: Restaurant Dashboard Receives New Order
+
+**Open 2 browser tabs/Postman windows:**
+
+**Tab 1 - Restaurant Dashboard:**
+```
+1. Connect to ws://localhost:3001/orders
+2. Emit: register_vendor → { vendorType: "restaurant", vendorId: "YOUR_RESTAURANT_ID" }
+3. Wait and listen for: 'order_ready' event
+```
+
+**Tab 2 - Simulate: Create an order via REST API**
+```
+POST http://localhost:3001/api/v1/orders/confirm-draft
+(with proper auth token and order data)
+```
+
+✅ **Expected:** Tab 1 receives `order_ready` with full order data.
+
+---
+
+### Test 2: Rider Gets New Order Notification
+
+**Open 2 connections:**
+
+**Connection 1 - Rider on `/rider-location`:**
+```
+1. Connect to ws://localhost:3001/rider-location
+2. Emit: register_rider → { riderId: "RIDER_USER_ID" }
+3. Emit: update_location → { riderId: "RIDER_USER_ID", latitude: 2.0469, longitude: 45.3182 }
+4. Emit: update_status → { riderId: "RIDER_USER_ID", status: "online" }
+```
+
+**Connection 2 - Rider on `/orders`:**
+```
+1. Connect to ws://localhost:3001/orders
+2. Emit: register_rider → { riderId: "RIDER_USER_ID" }
+3. Listen for: 'new_order_nearby' event
+```
+
+**Then:** Create an order near the rider's location.
+
+✅ **Expected:** Connection 2 receives `new_order_nearby` with order details + distance.
+
+---
+
+### Test 3: Customer Tracks Order in Real-Time
+
+**Open 3 connections:**
+
+**Connection 1 - Customer on `/orders`:**
+```
+1. Connect to ws://localhost:3001/orders
+2. Emit: register_customer → { customerId: "CUSTOMER_USER_ID" }
+3. Listen for: 'order_status_updated', 'rider_assigned', 'rider_location_update'
+```
+
+**Connection 2 - Rider on `/rider-location`:**
+```
+1. Connect to ws://localhost:3001/rider-location
+2. Emit: register_rider → { riderId: "RIDER_USER_ID" }
+3. After rider accepts order, emit location updates:
+   Emit: update_location → { riderId: "RIDER_USER_ID", latitude: 2.0470, longitude: 45.3183 }
+   Emit: update_location → { riderId: "RIDER_USER_ID", latitude: 2.0475, longitude: 45.3185 }
+```
+
+✅ **Expected:** Connection 1 receives:
+- `order_status_updated` when order status changes
+- `rider_assigned` when rider accepts
+- `rider_location_update` with GPS coordinates as rider moves
+
+---
+
+### Test 4: Admin Receives Escalation
+
+**Connection - Admin on `/orders`:**
+```
+1. Connect to ws://localhost:3001/orders
+2. Emit: register_admin → { userId: "ADMIN_USER_ID" }
+3. Listen for: 'new_payment', 'order_needs_attention', 'order_escalation'
+```
+
+**Then:** Create a delivery order in a location with no online riders.
+
+✅ **Expected:** After ~10 minutes, admin receives `order_escalation` with restaurant phone, customer phone, nearby rider phones.
+
+---
+
+### Test 5: Ping/Pong (Connection Health Check)
+
+```
+1. Connect to ws://localhost:3001/orders
+2. Emit: ping → {}
+3. Listen for: 'pong' event
+```
+
+✅ **Expected:** Receive `pong` event immediately.
+
+---
+
+## 📱 For Mobile App Developers
+
+### Connection Setup (React Native / Flutter)
+
+**React Native (socket.io-client):**
+```javascript
+import { io } from 'socket.io-client';
+
+// Connection 1: Orders namespace (for order notifications)
+const ordersSocket = io('https://your-api.com/orders', {
+  transports: ['websocket', 'polling'],
+  auth: { token: 'YOUR_JWT_TOKEN' },  // Optional, not enforced currently
+});
+
+// Connection 2: Rider location namespace (for GPS tracking)
+const locationSocket = io('https://your-api.com/rider-location', {
+  transports: ['websocket', 'polling'],
+  auth: { token: 'YOUR_JWT_TOKEN' },
+});
+```
+
+### Rider App - Minimum Integration
+
+```javascript
+// Step 1: Connect to BOTH namespaces
+const ordersSocket = io('https://api.droviapp.com/orders', { transports: ['websocket'] });
+const locationSocket = io('https://api.droviapp.com/rider-location', { transports: ['websocket'] });
+
+// Step 2: Register on BOTH
+ordersSocket.emit('register_rider', { riderId: USER_ID }, (res) => console.log(res));
+locationSocket.emit('register_rider', { riderId: USER_ID }, (res) => console.log(res));
+
+// Step 3: Go online
+locationSocket.emit('update_status', { riderId: USER_ID, status: 'online' });
+
+// Step 4: Start sending GPS
+navigator.geolocation.watchPosition((pos) => {
+  locationSocket.emit('update_location', {
+    riderId: USER_ID,
+    latitude: pos.coords.latitude,
+    longitude: pos.coords.longitude,
+    speed: pos.coords.speed,
+    heading: pos.coords.heading,
+    accuracy: pos.coords.accuracy,
+  });
+});
+
+// Step 5: Listen for new orders (on ORDERS socket)
+ordersSocket.on('new_order_nearby', (data) => {
+  // Show order notification to rider
+  // data = { orderId, publicId, vendorName, distance, estimatedEarnings, items, ... }
+  showOrderNotification(data);
+});
+
+// Step 6: Listen for order no longer available
+ordersSocket.on('order_no_longer_available', (data) => {
+  // Remove order from UI - someone else took it
+  removeOrderFromUI(data.orderId);
+});
+
+// Step 7: Accept order (via REST API, NOT socket)
+// POST /api/v1/orders/:orderId/rider-accept
+
+// Step 8: Listen for acceptance confirmation
+ordersSocket.on('order_accepted', (data) => {
+  // Navigate to active order screen
+  navigateToActiveOrder(data.order);
+});
+
+// Step 9: Listen for status updates on your active order
+ordersSocket.on('order_status_update', (data) => {
+  // Update UI: data = { orderId, status, timestamp }
+  updateOrderStatus(data);
+});
+```
+
+### Customer App - Minimum Integration
+
+```javascript
+// Step 1: Connect to orders namespace
+const socket = io('https://api.droviapp.com/orders', { transports: ['websocket'] });
+
+// Step 2: Register as customer
+socket.emit('register_customer', { customerId: USER_ID });
+
+// Step 3: Subscribe to your specific order
+socket.emit('subscribe_to_order', { orderId: ORDER_ID, customerId: USER_ID });
+
+// Step 4: Listen for status updates
+socket.on('order_status_updated', (data) => {
+  // data = { orderId, status, timestamp, ...fullOrderData }
+  updateOrderStatus(data.status);
+});
+
+// Step 5: Listen for rider assignment
+socket.on('rider_assigned', (data) => {
+  // data = { orderId, riderId }
+  showRiderAssigned();
+});
+
+// Step 6: Listen for rider live location
+socket.on('rider_location_update', (data) => {
+  // data = { orderId, location: { latitude, longitude, timestamp } }
+  updateRiderMarkerOnMap(data.location.latitude, data.location.longitude);
+});
+
+// Step 7: Cleanup when leaving
+socket.emit('unsubscribe_from_order', { orderId: ORDER_ID });
+socket.disconnect();
+```
+
+### Restaurant/Shop Dashboard - Minimum Integration
+
+```javascript
+// Step 1: Connect to orders namespace
+const socket = io('https://api.droviapp.com/orders', { transports: ['websocket'] });
+
+// Step 2: Register as vendor
+socket.emit('register_vendor', {
+  vendorType: 'restaurant',  // or 'shop'
+  vendorId: RESTAURANT_ID,   // your restaurant/shop ID
+}, (res) => console.log('Joined room:', res.room));
+
+// Step 3: Listen for new orders
+socket.on('order_ready', (order) => {
+  // Full order object - show in orders list
+  addNewOrder(order);
+  playNotificationSound();
+});
+
+// Step 4: Listen for rider acceptance
+socket.on('rider_accepted', (data) => {
+  // data = { publicId, riderInfo: { name }, ... }
+  showRiderInfo(data);
+});
+
+// Step 5: Listen for rider location
+socket.on('rider_location_update', (data) => {
+  // data = { orderId, location: { latitude, longitude, timestamp } }
+  updateRiderLocationOnMap(data);
+});
+```
+
+---
+
+## ⚠️ Important Notes
+
+1. **Rider needs 2 socket connections**: `/orders` (for order notifications) AND `/rider-location` (for GPS tracking)
+2. **Customer needs 1 connection**: `/orders` only
+3. **Restaurant/Shop needs 1 connection**: `/orders` only, register as vendor
+4. **Admin needs 1-2 connections**: `/orders` (for order alerts) + optionally `/rider-location` (for live rider map)
+5. **Rider accepts/rejects orders via REST API**, NOT via sockets. The confirmation comes back via socket.
+6. **City-based filtering**: Admins only receive events for their assigned city. Riders only see orders in their city.
+7. **Rider disconnect grace period**: 5 seconds before marking offline (handles brief connectivity drops)
+8. **Order retry**: System retries notifying riders every 2 minutes, up to 5 times (10 min total)
+9. **IDs used**: All socket registrations use the User's `userId` (from auth), NOT the rider/customer table ID
+10. **No auth guard currently enforced on WebSocket** - but `auth.token` is sent for future use
+
+---
+
+## 🏗️ Architecture Diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    BACKEND (NestJS)                           │
+│                    Port 3001                                  │
+│                                                              │
+│  ┌─────────────────────┐    ┌──────────────────────────┐     │
+│  │  /orders namespace  │    │  /rider-location namespace│     │
+│  │  (OrdersGateway)    │    │  (RiderLocationGateway)   │     │
+│  │                     │    │                          │     │
+│  │  Maps:              │    │  Maps:                   │     │
+│  │  - adminSockets     │    │  - riderSockets          │     │
+│  │  - customerSockets  │    │  - adminRiderSubscribers │     │
+│  │  - riderSockets     │    │                          │     │
+│  │  - orderSubscriptions│   │  Calls OrdersGateway to  │     │
+│  │  - vendor rooms     │    │  push location to        │     │
+│  │                     │    │  customers & vendors      │     │
+│  └─────────┬───────────┘    └─────────┬────────────────┘     │
+│            │                          │                      │
+│            │    ┌─────────────────┐   │                      │
+│            └────┤ OrderNotification├──┘                      │
+│                 │ Service         │                           │
+│                 │                 │                           │
+│                 │ - Find nearby   │                           │
+│                 │   riders (Redis)│                           │
+│                 │ - Notify top 4  │                           │
+│                 │ - Retry 2min×5  │                           │
+│                 │ - Escalate admin│                           │
+│                 └─────────────────┘                           │
+└──────────────────────────────────────────────────────────────┘
+         │              │              │              │
+    ┌────┴────┐    ┌───┴────┐    ┌───┴────┐    ┌───┴────┐
+    │ Admin   │    │Customer│    │ Rider  │    │Restaurant│
+    │Dashboard│    │  App   │    │  App   │    │Dashboard │
+    │         │    │        │    │        │    │          │
+    │/orders  │    │/orders │    │/orders │    │/orders   │
+    │         │    │        │    │+ /rider│    │          │
+    │         │    │        │    │-location│   │          │
+    └─────────┘    └────────┘    └────────┘    └──────────┘
+```
