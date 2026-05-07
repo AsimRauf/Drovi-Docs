@@ -42,10 +42,15 @@ of record for the connected account.
 
 ## 2. Endpoint reference
 
-Base URL: same `API_BASE` your app already uses (e.g. `https://api.drovi.com/api/v1`).
-All endpoints below require the rider's existing JWT bearer token in
-`Authorization`, **except** `mobile-bridge` which is public (Stripe
-calls it unauthenticated as a redirect target).
+**Base URL (production):** `https://drove-backend-f1d3892431b4.herokuapp.com/api/v1`
+
+All endpoints below are relative to that base. They require the rider's
+existing JWT bearer token in `Authorization`, **except** `mobile-bridge`
+which is public (Stripe calls it unauthenticated as a redirect target).
+
+If you're testing against staging or a local backend, just substitute
+the host — the path shapes (`/stripe-connect/...`, `/riders/wallet/...`)
+are identical.
 
 ### 2.1 `GET /stripe-connect/status?holderType=rider`
 
@@ -87,8 +92,8 @@ subsequent call returns a new short-lived link to the same account.
 ```json
 {
   "holderType": "rider",
-  "returnUrl":  "https://api.drovi.com/api/v1/stripe-connect/mobile-bridge?scheme=drovi-rider&path=connect/return",
-  "refreshUrl": "https://api.drovi.com/api/v1/stripe-connect/mobile-bridge?scheme=drovi-rider&path=connect/refresh"
+  "returnUrl":  "https://drove-backend-f1d3892431b4.herokuapp.com/api/v1/stripe-connect/mobile-bridge?scheme=drovi-rider&path=connect/return",
+  "refreshUrl": "https://drove-backend-f1d3892431b4.herokuapp.com/api/v1/stripe-connect/mobile-bridge?scheme=drovi-rider&path=connect/refresh"
 }
 ```
 
@@ -171,80 +176,92 @@ through the safe-message filter (see §7).
 
 ---
 
-## 3. The mobile onboarding flow, step by step
+## 3. Onboarding flow — how the rider gets back to the app
 
-This is the part that trips up first-time integrators. Read carefully.
-
-### 3.1 What you must build
-
-1. A "Connect Stripe" CTA on the wallet screen, shown when
-   `connectStatus.connected === false`.
-2. A "Finish Stripe onboarding" CTA when `connected && !payoutsEnabled`.
-3. A "Withdraw" CTA when `connected && payoutsEnabled`.
-
-All three CTAs share the same handler at the start: open an in-app
-browser session pointed at the Stripe URL. The URL itself comes from
-`/stripe-connect/onboard`.
-
-### 3.2 Construct the bridge URLs
-
-Pseudocode:
+This is the part that trips up first-time integrators. The mechanism
+has FIVE entities involved:
 
 ```
-SCHEME = appDeepLinkScheme()        // e.g. "drovi-rider" in prod, "drovi-rider-dev" in dev
-
-bridge(path) =
-  API_BASE + "/stripe-connect/mobile-bridge"
-  + "?scheme=" + urlEncode(SCHEME)
-  + "&path="   + urlEncode(path)
-
-returnUrl  = bridge("connect/return")
-refreshUrl = bridge("connect/refresh")
-
-deepLinkReturn = SCHEME + "://connect/return"   // what your in-app browser will watch for
+┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌────────┐
+│ Rider  │   │ Your App │   │  Drovi   │   │  Stripe  │   │   OS   │
+│        │   │          │   │ Backend  │   │  Hosted  │   │ Router │
+└────────┘   └──────────┘   └──────────┘   └──────────┘   └────────┘
 ```
 
-`appDeepLinkScheme()` should read the value from your build config —
-**not hardcoded** — because dev and prod schemes differ.
+The trick: Stripe **only accepts HTTPS URLs** for `return_url` /
+`refresh_url`. Custom-scheme URLs (`drovi-rider://...`) are rejected
+outright with "invalid URL" — that's why a naive integration fails.
 
-### 3.3 Call `/onboard` and open Stripe
+So we use a **bridge**: an HTTPS endpoint on Drovi's backend that does
+nothing but serve a tiny HTML page which immediately redirects to the
+deep link. Stripe is happy (HTTPS), the OS is happy (the deep link
+shows up in the in-app browser), and your in-app browser session
+recognises its redirect target and auto-closes.
+
+### 3.1 The eight steps, end to end
+
+This is the exact sequence — what each entity does, in order. Use it
+as your mental model when debugging.
+
+| # | Who | What |
+|---|---|---|
+| 1 | **Your App** | Rider taps "Connect Stripe & Withdraw". App constructs `returnUrl` and `refreshUrl` as **HTTPS bridge URLs** pointing at Drovi backend (see §3.2). |
+| 2 | **Your App → Drovi Backend** | `POST /stripe-connect/onboard` with `{ holderType: "rider", returnUrl, refreshUrl }`. |
+| 3 | **Drovi Backend → Stripe** | Backend creates an Express account (first call only) + asks Stripe for a hosted onboarding link, passing your bridge URLs as `return_url` / `refresh_url`. Returns `{ url, stripeAccountId }` to your app. |
+| 4 | **Your App** | Open an **in-app auth session** (NOT a regular WebView, NOT the system browser) with: `openAuthSession(stripeOnboardingUrl, callbackScheme: "drovi-rider")`. The session is told to watch for any URL whose scheme is `drovi-rider://`. Stripe's hosted onboarding loads. |
+| 5 | **Rider → Stripe Hosted** | Rider fills SSN, bank account, address, etc. on Stripe's page. Stripe verifies. When they tap "Done" (or hit the back button), Stripe navigates the in-app browser to `returnUrl` (the bridge HTTPS URL). |
+| 6 | **Drovi Backend (bridge)** | The bridge endpoint serves an HTML page that contains both `<meta http-equiv="refresh" content="0;url=drovi-rider://connect/return">` and `window.location.replace("drovi-rider://connect/return")`. The browser navigates to that custom-scheme URL. |
+| 7 | **OS Router** | The OS sees a `drovi-rider://` URL in the in-app browser. It checks which app registered that scheme — **your app** — and hands the URL over. |
+| 8 | **In-app session auto-closes** | Because step 4 told the auth session to watch for `drovi-rider://`, it sees the OS routing happen and **closes itself**. Your app is back in the foreground. The session's completion handler fires with success. |
+
+After step 8, **always** re-fetch `/stripe-connect/status` to know the
+real state (don't trust session-result enums — see §3.5).
+
+### 3.2 Building the URLs
+
+The two bridge URLs you pass to `/onboard` must be HTTPS and point at
+Drovi's `mobile-bridge` endpoint. The `scheme` query param must match
+your app's deep-link scheme (registered in Info.plist / Manifest), and
+the `path` must be either `connect/return` or `connect/refresh`.
 
 ```
-POST /stripe-connect/onboard
-   body: { holderType: "rider", returnUrl, refreshUrl }
-→ { url, stripeAccountId }
+SCHEME      = appDeepLinkScheme()     // "drovi-rider" prod, "drovi-rider-dev" dev
+API_BASE    = "https://drove-backend-f1d3892431b4.herokuapp.com/api/v1"
 
-openInAppAuthSession(url, deepLinkReturn)
+returnUrl   = API_BASE + "/stripe-connect/mobile-bridge"
+                       + "?scheme=" + urlEncode(SCHEME)
+                       + "&path="   + urlEncode("connect/return")
+
+refreshUrl  = API_BASE + "/stripe-connect/mobile-bridge"
+                       + "?scheme=" + urlEncode(SCHEME)
+                       + "&path="   + urlEncode("connect/refresh")
+
+callback    = SCHEME + "://"     // what the in-app browser session watches for
 ```
 
-`openInAppAuthSession` is your platform's "ASWebAuthenticationSession
-on iOS, Custom Tabs on Android, watching for a redirect URL" primitive:
+`appDeepLinkScheme()` should read from your build config — **never
+hardcode** — because dev and prod schemes differ
+(`drovi-rider-dev` vs `drovi-rider`).
 
-| Stack | Function |
+### 3.3 Opening the in-app auth session — by stack
+
+You need your platform's "ASWebAuthenticationSession on iOS, Chrome
+Custom Tabs on Android, watching for a redirect URL" primitive — NOT
+a normal WebView and NOT a system browser launch. The auto-close on
+deep-link is what makes this whole flow work.
+
+| Stack | Code (pseudocode) |
 |---|---|
-| Flutter | `flutter_web_auth_2: authenticate(url, callbackUrlScheme: "drovi-rider")` |
-| React Native (Expo) | `WebBrowser.openAuthSessionAsync(url, deepLinkReturn)` |
-| Native iOS | `ASWebAuthenticationSession(url:, callbackURLScheme:, completionHandler:)` |
-| Native Android | Custom Tabs + an intent filter on the deep-link scheme |
+| **Flutter** | `final result = await FlutterWebAuth2.authenticate(url: stripeUrl, callbackUrlScheme: "drovi-rider");` |
+| **React Native (Expo)** | `await WebBrowser.openAuthSessionAsync(stripeUrl, "drovi-rider://connect/return");` |
+| **React Native (bare)** | `react-native-inappbrowser-reborn` → `InAppBrowser.openAuth(stripeUrl, "drovi-rider://connect/return")` |
+| **Native iOS (Swift)** | `ASWebAuthenticationSession(url: stripeUrl, callbackURLScheme: "drovi-rider") { url, error in … }` |
+| **Native Android (Kotlin)** | Use Chrome Custom Tabs + a `BroadcastReceiver` keyed off your deep-link `intent-filter`; close the Custom Tab when you receive the deep-link intent. (Or use AppAuth-Android, which wraps this.) |
 
-The session **auto-closes** when the in-app browser navigates to
-`deepLinkReturn`. Stripe's onboarding redirects to your bridge HTTPS
-URL → bridge HTML redirects to `drovi-rider://connect/return` → OS
-recognises the scheme → session closes with success.
+### 3.4 Registering the deep-link scheme
 
-### 3.4 After the session closes
-
-Either way (success, cancel, or timeout) — re-fetch `/stripe-connect/status`
-and re-render. Don't trust the session result type for state; trust
-the status endpoint.
-
-```
-afterSession() {
-  loadWalletData()   // hits /status, /wallet, /withdrawals
-}
-```
-
-### 3.5 Configure the deep link
+The OS will only route a `drovi-rider://` URL to your app if your app
+declares it.
 
 **iOS (`Info.plist`):**
 ```xml
@@ -257,9 +274,9 @@ afterSession() {
 </array>
 ```
 
-**Android (`AndroidManifest.xml`, in your launcher activity):**
+**Android (`AndroidManifest.xml`, inside your launcher `<activity>`):**
 ```xml
-<intent-filter>
+<intent-filter android:autoVerify="false">
   <action android:name="android.intent.action.VIEW"/>
   <category android:name="android.intent.category.DEFAULT"/>
   <category android:name="android.intent.category.BROWSABLE"/>
@@ -267,11 +284,49 @@ afterSession() {
 </intent-filter>
 ```
 
-**Flutter** — same plus declare in `pubspec.yaml`/`Info.plist` per
-`flutter_web_auth_2` README.
+**Flutter** — same as above, plus declare in your platform-specific
+config per the `flutter_web_auth_2` README.
 
-**React Native (Expo)** — set `"scheme"` in `app.json`. `Linking.createURL("")`
-returns `<scheme>://` so you don't need to hardcode.
+**React Native (Expo)** — set `"scheme": "drovi-rider"` (and
+`"drovi-rider-dev"` for dev) in `app.json`. `Linking.createURL("")`
+will then return `drovi-rider://`.
+
+> **If your scheme isn't already on the backend allowlist** (see §2.3),
+> ask the Drovi backend team to add it. Anything not on the list returns
+> 400 Bad Request from the bridge endpoint.
+
+### 3.5 What to do after the session closes
+
+The auth session resolves in three ways:
+
+| Result | Cause | What to do |
+|---|---|---|
+| **success** | Browser saw the `drovi-rider://` URL and closed cleanly | Re-fetch `/stripe-connect/status`, re-render. |
+| **cancel** | Rider tapped "Cancel" in the in-app browser | Re-fetch `/stripe-connect/status` anyway — they may have submitted partial info before cancelling, in which case `connected:true` but `payoutsEnabled:false`. |
+| **error / timeout** | Network blip, OS killed the browser, etc. | Same — re-fetch `/stripe-connect/status`, re-render. Show a toast if needed. |
+
+**Always re-fetch status after the session closes**, regardless of
+result type. Status is the source of truth — the session result is
+just a hint.
+
+```
+afterAuthSession() async {
+  await loadWalletData();   // hits /stripe-connect/status, /riders/wallet, /riders/wallet/withdrawals
+  // UI re-renders based on connectStatus.connected / payoutsEnabled
+}
+```
+
+### 3.6 What if the rider closes the browser before Stripe redirects?
+
+Possible — they tap the back button mid-onboarding, or the OS kills
+the browser to free memory. In that case the auth session resolves as
+`cancel`, **the deep link is never fired**, and the rider is back in
+your app with whatever Stripe had saved at the moment they bailed
+(usually nothing — Stripe only persists when they tap "Done").
+
+Your status fetch in §3.5 will tell you exactly where things stand
+(probably `connected:false` if they bailed before completion). The CTA
+should still read "Connect Stripe & Withdraw" — let them try again.
 
 ---
 
