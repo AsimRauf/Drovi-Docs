@@ -1,0 +1,69 @@
+# Drovi supervisor-issue auto-fixer
+# ----------------------------------
+# Drop this file into EACH target repo at: .github/workflows/claude.yml
+# It wakes when an issue is opened/labeled with `claude-fix`, lets Claude
+# read the issue, make the fix on a new branch, and OPEN A PULL REQUEST.
+# It NEVER pushes to main directly (your Railway/Vercel deploys are gated).
+#
+# Auth: uses CLAUDE_CODE_OAUTH_TOKEN generated from your Claude Max
+# subscription via `/install-github-app` (or claude.ai/code GitHub setup).
+# This bills against your Max plan, NOT the metered Anthropic API.
+#
+# Per-account note: because Asim's and Mohamed's tokens can't see each
+# other's private repos, install the Claude GitHub App SEPARATELY on each
+# account and add this secret in each repo (or at the account level).
+
+name: Claude Auto-Fix Supervisor Issues
+
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write        # create branches / commits
+  pull-requests: write   # open the PR
+  issues: write          # comment back on the issue
+
+jobs:
+  claude-fix:
+    # Only run for the routing label. Ignore everything else.
+    if: |
+      (github.event.action == 'opened' && contains(github.event.issue.labels.*.name, 'claude-fix')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'claude-fix')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The trigger context (issue title/body) is passed automatically.
+          prompt: |
+            A supervisor reported the issue below. Your job:
+            1. Reproduce / locate the problem in THIS repository.
+            2. Make the smallest correct fix. Match the surrounding code style.
+            3. Run the project's lint/test/build if a quick command exists.
+            4. Open a pull request against `main` titled "fix: <short summary> (#${{ github.event.issue.number }})".
+               - In the PR body, explain the root cause, the fix, and any risk.
+               - Link the issue with "Closes #${{ github.event.issue.number }}".
+            5. Comment on the issue with the PR link and a one-line summary.
+
+            Rules:
+            - DO NOT push to main. Always use a new branch + PR.
+            - DO NOT change deploy config, secrets, env, or CI unless the issue is explicitly about them.
+            - If you cannot reproduce or the issue is ambiguous, DO NOT guess — comment on the
+              issue asking the supervisor for the missing detail, and open no PR.
+            - Keep the diff focused; no drive-by refactors.
+
+            --- SUPERVISOR ISSUE ---
+            Title: ${{ github.event.issue.title }}
+
+            ${{ github.event.issue.body }}
+          # Tighten the tools Claude may use in CI.
+          claude_args: |
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(git*),Bash(npm*),Bash(pnpm*),Bash(yarn*),Bash(npx*)"
